@@ -43,15 +43,17 @@ func NewKeyFromECDSA(privateKey *ecdsa.PrivateKey) (*Key, error) {
 	// 计算地址
 	address := crypto.PubkeyToAddress(privateKey.PublicKey)
 
-	// 创建go-ethereum的Key结构
-	return &keystore.Key{
-		Address:    address,
+	// 创建通用Key结构
+	return &Key{
+		Address:    address.Hex(),
 		PrivateKey: privateKey,
-		// go-ethereum的Key结构体只有Address和PrivateKey字段
+		PublicKey:  &privateKey.PublicKey,
+		Algorithm:  "ecdsa",
+		CreatedAt:  time.Now().Unix(),
 	}, nil
 }
 
-// EncryptKey 使用go-ethereum的keystore包加密密钥
+// EncryptKey 加密密钥，支持多种加密方案
 // 将密钥使用密码加密并返回加密后的JSON数据
 func EncryptKey(key *Key, password string, options *KeyStoreOptions) ([]byte, error) {
 	// 验证密码
@@ -59,14 +61,61 @@ func EncryptKey(key *Key, password string, options *KeyStoreOptions) ([]byte, er
 		return nil, err
 	}
 
-	// 使用go-ethereum的加密功能
-	return keystore.EncryptKey(key, password, options.ScryptN, options.ScryptP)
+	// 对于ECDSA密钥，使用go-ethereum的加密功能
+	if ecdsaKey, ok := key.PrivateKey.(*ecdsa.PrivateKey); ok {
+		// 创建临时的go-ethereum Key结构用于加密
+		ethKey := &keystore.Key{
+			Address:    common.HexToAddress(key.Address),
+			PrivateKey: ecdsaKey,
+		}
+
+		// 使用go-ethereum的加密功能
+		encryptedData, err := keystore.EncryptKey(ethKey, password, options.ScryptN, options.ScryptP)
+		if err != nil {
+			return nil, err
+		}
+
+		// 修改加密数据，添加算法信息
+		var keyStoreFile KeyStoreFile
+		if err := json.Unmarshal(encryptedData, &keyStoreFile); err != nil {
+			return nil, err
+		}
+		keyStoreFile.Algorithm = key.Algorithm
+
+		return json.Marshal(keyStoreFile)
+	}
+
+	return nil, fmt.Errorf("unsupported private key type: %T", key.PrivateKey)
 }
 
-// DecryptKey 使用go-ethereum的keystore包解密密钥
+// DecryptKey 解密密钥，支持多种加密方案
 // 从加密的JSON数据中解密出密钥
 func DecryptKey(keyJSON []byte, password string) (*Key, error) {
-	return keystore.DecryptKey(keyJSON, password)
+	// 解析密钥文件，获取算法信息
+	var keyStoreFile KeyStoreFile
+	if err := json.Unmarshal(keyJSON, &keyStoreFile); err != nil {
+		return nil, err
+	}
+
+	// 对于ECDSA密钥，使用go-ethereum的解密功能
+	if keyStoreFile.Algorithm == "ecdsa" || keyStoreFile.Algorithm == "" {
+		// 使用go-ethereum的解密功能
+		ethKey, err := keystore.DecryptKey(keyJSON, password)
+		if err != nil {
+			return nil, err
+		}
+
+		// 转换为通用Key结构
+		return &Key{
+			Address:    ethKey.Address.Hex(),
+			PrivateKey: ethKey.PrivateKey,
+			PublicKey:  &ethKey.PrivateKey.PublicKey,
+			Algorithm:  "ecdsa",
+			CreatedAt:  time.Now().Unix(),
+		}, nil
+	}
+
+	return nil, fmt.Errorf("unsupported algorithm: %s", keyStoreFile.Algorithm)
 }
 
 // validatePassword validates a password against the provided options
@@ -101,7 +150,7 @@ func validatePassword(password string, options *KeyStoreOptions) error {
 	return nil
 }
 
-// SaveKeyStoreFile 使用go-ethereum的方式保存密钥文件
+// SaveKeyStoreFile 保存密钥文件，支持多种区块链平台
 // 将加密后的密钥保存到磁盘
 func SaveKeyStoreFile(keyJSON []byte, dir string) (string, error) {
 	// 确保目录存在
@@ -109,18 +158,15 @@ func SaveKeyStoreFile(keyJSON []byte, dir string) (string, error) {
 		return "", fmt.Errorf("failed to create directory: %w", err)
 	}
 
-	// 解析密钥文件以获取地址
-	var keyStoreFile struct {
-		Address string `json:"address"`
-	}
+	// 解析密钥文件以获取地址和算法
+	var keyStoreFile KeyStoreFile
 	if err := json.Unmarshal(keyJSON, &keyStoreFile); err != nil {
 		return "", fmt.Errorf("failed to unmarshal key file: %w", err)
 	}
 
-	// 构建文件名：UTC--<yyyy-mm-dd>--<address>
+	// 构建文件名：UTC--<yyyy-mm-dd>--<algorithm>--<address>
 	timestamp := time.Now().Format("2006-01-02")
-	addressHex := common.HexToAddress(keyStoreFile.Address).Hex()
-	filename := fmt.Sprintf("UTC--%s--%s", timestamp, addressHex)
+	filename := fmt.Sprintf("UTC--%s--%s--%s", timestamp, keyStoreFile.Algorithm, keyStoreFile.Address)
 	filePath := filepath.Join(dir, filename)
 
 	// 写入文件，设置权限为仅所有者可读写

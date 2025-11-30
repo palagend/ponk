@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/ecdsa"
 	"fmt"
 	"log"
 	"os"
@@ -21,7 +22,7 @@ func main() {
 	fmt.Printf("使用临时目录: %s\n\n", tempDir)
 
 	// 1. 初始化KeyStore
-	ks := keystore.NewKeyStore(tempDir, &keystore.KeyStoreOptions{
+	ks, err := keystore.NewKeyStore(tempDir, &keystore.KeyStoreOptions{
 		ScryptN:            16384,
 		ScryptR:            8,
 		ScryptP:            1,
@@ -29,6 +30,9 @@ func main() {
 		MaxPasswordLen:     128,
 		PasswordComplexity: true,
 	})
+	if err != nil {
+		log.Fatalf("初始化KeyStore失败: %v", err)
+	}
 
 	// 2. 创建新账户（生成密钥对并加密存储）
 	fmt.Println("[1] 创建新账户")
@@ -65,9 +69,13 @@ func main() {
 		log.Fatalf("获取密钥失败: %v", err)
 	}
 	fmt.Printf("\033[32m[OK]\033[0m 密钥获取成功!\n")
-	fmt.Printf("   ID: %s\n", key.Id.String())
-	fmt.Printf("   地址: %s\n", key.Address.Hex())
-	fmt.Printf("   公钥: X=%x, Y=%x\n\n", key.PrivateKey.PublicKey.X.Bytes(), key.PrivateKey.PublicKey.Y.Bytes())
+	fmt.Printf("   地址: %s\n", key.Address)
+	// 检查密钥类型并打印公钥
+	if ecdsaKey, ok := key.PrivateKey.(interface{ Public() interface{} }); ok {
+		if pubKey, ok := ecdsaKey.Public().(*ecdsa.PublicKey); ok {
+			fmt.Printf("   公钥: X=%x, Y=%x\n\n", pubKey.X.Bytes(), pubKey.Y.Bytes())
+		}
+	}
 
 	// 6. 错误密码测试
 	fmt.Println("[5] 使用错误密码尝试获取密钥")

@@ -4,9 +4,9 @@ import (
 	"crypto/ecdsa"
 	"crypto/rand"
 	"log"
-	"math/big"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -34,7 +34,10 @@ func TestKeyStoreBasicOperations(t *testing.T) {
 	options.ScryptN = 4096 // 降低N值以加快测试速度
 	options.ScryptP = 1
 	options.ScryptR = 8
-	ks := NewKeyStore(tempDir, options)
+	ks, err := NewKeyStore(tempDir, options)
+	if err != nil {
+		t.Fatalf("创建keystore失败: %v", err)
+	}
 
 	// 测试1: 创建新账户
 	password := "TestPassword123!"
@@ -72,7 +75,7 @@ func TestKeyStoreBasicOperations(t *testing.T) {
 	if key == nil {
 		t.Fatalf("返回的密钥为空")
 	}
-	if key.Address.Hex() != address {
+	if key.Address != address {
 		t.Fatalf("密钥地址不匹配")
 	}
 
@@ -126,7 +129,10 @@ func TestKeyImportExport(t *testing.T) {
 		t.Fatalf("创建临时目录失败: %v", err)
 	}
 
-	ks := NewKeyStore(tempDir, nil)
+	ks, err := NewKeyStore(tempDir, nil)
+	if err != nil {
+		t.Fatalf("创建keystore失败: %v", err)
+	}
 
 	// 创建一个账户用于导出
 	password := "ExportPassword123!"
@@ -178,7 +184,10 @@ func TestImportECDSA(t *testing.T) {
 		t.Fatalf("创建临时目录失败: %v", err)
 	}
 
-	ks := NewKeyStore(tempDir, nil)
+	ks, err := NewKeyStore(tempDir, nil)
+	if err != nil {
+		t.Fatalf("创建keystore失败: %v", err)
+	}
 
 	// 以太坊通常使用secp256k1曲线生成密钥
 	privateKey, err := ecdsa.GenerateKey(crypto.S256(), rand.Reader)
@@ -200,8 +209,12 @@ func TestImportECDSA(t *testing.T) {
 	}
 
 	// 验证私钥是否匹配
-	if key.PrivateKey.D.Cmp(privateKey.D) != 0 {
-		t.Fatalf("导入的私钥与原始私钥不匹配")
+	if importedECDSAKey, ok := key.PrivateKey.(*ecdsa.PrivateKey); ok {
+		if importedECDSAKey.D.Cmp(privateKey.D) != 0 {
+			t.Fatalf("导入的私钥与原始私钥不匹配")
+		}
+	} else {
+		t.Fatalf("导入的私钥不是ECDSA类型")
 	}
 }
 
@@ -248,7 +261,10 @@ func TestWalletInterface(t *testing.T) {
 	}
 
 	// 通过keystore创建一个账户
-	ks := NewKeyStore(tempDir, nil)
+	ks, err := NewKeyStore(tempDir, nil)
+	if err != nil {
+		t.Fatalf("创建keystore失败: %v", err)
+	}
 	password := "WalletPassword123!"
 	address, err := ks.CreateNewAccount(password)
 	if err != nil {
@@ -268,7 +284,8 @@ func TestWalletInterface(t *testing.T) {
 	if len(accounts) != 1 {
 		t.Fatalf("预期1个账户，实际有%d个", len(accounts))
 	}
-	if accounts[0] != address {
+	// 比较地址时忽略大小写，因为以太坊地址大小写不敏感
+	if strings.ToLower(accounts[0]) != strings.ToLower(address) {
 		t.Fatalf("账户地址不匹配,期望%s,实际%s", address, accounts[0])
 	}
 
@@ -303,7 +320,10 @@ func TestCustomOptions(t *testing.T) {
 	customOptions.ScryptR = 8
 
 	// 直接使用默认keystore（已在TestCustomOptions中单独测试自定义选项）
-	ks := NewKeyStore(tempDir, nil)
+	ks, err := NewKeyStore(tempDir, nil)
+	if err != nil {
+		t.Fatalf("创建keystore失败: %v", err)
+	}
 
 	// 创建账户
 	password := "CustomOptionsPassword8!"
@@ -329,7 +349,10 @@ func TestCleanseKey(t *testing.T) {
 		t.Fatalf("创建临时目录失败: %v", err)
 	}
 
-	ks := NewKeyStore(tempDir, nil)
+	ks, err := NewKeyStore(tempDir, nil)
+	if err != nil {
+		t.Fatalf("创建keystore失败: %v", err)
+	}
 
 	// 创建账户
 	password := "CleansePassword34!"
@@ -344,20 +367,21 @@ func TestCleanseKey(t *testing.T) {
 		t.Fatalf("获取密钥失败: %v", err)
 	}
 
-	// 保存原始值的副本用于比较
-	originalD := new(big.Int).Set(key.PrivateKey.D)
-	originalAddress := key.Address
-
 	// 清理密钥
 	CleanseKey(key)
 
 	// 验证私钥已被清理
-	if key.PrivateKey.D.Cmp(originalD) == 0 {
+	if key.PrivateKey != nil {
 		t.Fatalf("私钥未被正确清理")
 	}
 
+	// 验证公钥已被清理
+	if key.PublicKey != nil {
+		t.Fatalf("公钥未被正确清理")
+	}
+
 	// 验证地址已被清理
-	if key.Address.Cmp(originalAddress) == 0 {
+	if key.Address != "" {
 		t.Fatalf("地址未被正确清理")
 	}
 }
@@ -372,10 +396,13 @@ func TestErrorHandling(t *testing.T) {
 		t.Fatalf("创建临时目录失败: %v", err)
 	}
 
-	ks := NewKeyStore(tempDir, nil)
+	ks, err := NewKeyStore(tempDir, nil)
+	if err != nil {
+		t.Fatalf("创建keystore失败: %v", err)
+	}
 
 	// 测试获取不存在的密钥
-	_, err := ks.GetKey("0123456789abcdef0123456789abcdef01234567", "password")
+	_, err = ks.GetKey("0123456789abcdef0123456789abcdef01234567", "password")
 	if err == nil {
 		t.Fatalf("预期获取不存在的密钥会失败，但成功了")
 	}

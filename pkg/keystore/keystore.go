@@ -3,7 +3,6 @@ package keystore
 
 import (
 	"crypto/ecdsa"
-	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,30 +13,58 @@ import (
 	"time"
 )
 
-// KeyStore manages a collection of encrypted keys
+// KeyStore manages a collection of encrypted keys for multiple blockchain platforms
 // 密钥库管理器，管理一组加密的密钥
 // 提供密钥的创建、导入、导出、删除等功能
 // 支持线程安全操作
 
 type KeyStore struct {
-	path    string           // keystore文件存储路径
-	options *KeyStoreOptions // 配置选项
-	keys    map[string]*Key  // 缓存的密钥（address -> Key）
-	mu      sync.RWMutex     // 读写锁，确保线程安全
+	path             string           // keystore文件存储路径
+	options          *KeyStoreOptions // 配置选项
+	algorithm        Algorithm        // 加密算法
+	addressGenerator AddressGenerator // 地址生成器
+	keys             map[string]*Key  // 缓存的密钥（address -> Key）
+	mu               sync.RWMutex     // 读写锁，确保线程安全
 }
 
 // NewKeyStore creates a new keystore manager
 // 创建新的密钥库管理器
 // 需要提供存储路径和配置选项
-func NewKeyStore(keydir string, options *KeyStoreOptions) *KeyStore {
+func NewKeyStore(keydir string, options *KeyStoreOptions) (*KeyStore, error) {
 	if options == nil {
 		options = DefaultKeyStoreOptions()
 	}
 
+	// Get algorithm instance
+	algorithm, err := GetAlgorithm(options.Algorithm)
+	if err != nil {
+		return nil, err
+	}
+
+	// Get address generator instance
+	addressGenerator, err := GetAddressGenerator(options.AddressGenerator)
+	if err != nil {
+		return nil, err
+	}
+
 	return &KeyStore{
-		path:    keydir,
-		options: options,
-		keys:    make(map[string]*Key),
+		path:             keydir,
+		options:          options,
+		algorithm:        algorithm,
+		addressGenerator: addressGenerator,
+		keys:             make(map[string]*Key),
+	}, nil
+}
+
+// NewKeyStoreWithConfig creates a new keystore manager with full configuration
+// 使用完整配置创建新的密钥库管理器
+func NewKeyStoreWithConfig(config *KeyStoreConfig) *KeyStore {
+	return &KeyStore{
+		path:             config.Path,
+		options:          config.Options,
+		algorithm:        config.Algorithm,
+		addressGenerator: config.AddressGenerator,
+		keys:             make(map[string]*Key),
 	}
 }
 
@@ -50,27 +77,35 @@ func (ks *KeyStore) CreateNewAccount(password string) (string, error) {
 	defer ks.mu.Unlock()
 
 	// 生成新的密钥对
-	privateKey, _, err := GenerateKeyPair()
+	privateKey, publicKey, err := ks.algorithm.GenerateKeyPair()
 	if err != nil {
 		return "", fmt.Errorf("failed to generate key pair: %w", err)
 	}
 
-	// 创建Key结构
-	key, err := NewKeyFromECDSA(privateKey)
+	// 生成地址
+	address, err := ks.addressGenerator.GenerateAddress(publicKey)
 	if err != nil {
-		return "", fmt.Errorf("failed to create key: %w", err)
+		return "", fmt.Errorf("failed to generate address: %w", err)
+	}
+
+	// 检查地址是否已存在
+	if _, exists := ks.keys[address]; exists {
+		return "", ErrKeyAlreadyExists
+	}
+
+	// 创建Key结构
+	key := &Key{
+		Address:    address,
+		PrivateKey: privateKey,
+		PublicKey:  publicKey,
+		Algorithm:  ks.algorithm.Name(),
+		CreatedAt:  time.Now().Unix(),
 	}
 
 	// 加密密钥
 	keyStoreFile, err := EncryptKey(key, password, ks.options)
 	if err != nil {
 		return "", fmt.Errorf("failed to encrypt key: %w", err)
-	}
-
-	// 检查地址是否已存在
-	addressHex := key.Address.Hex()
-	if _, exists := ks.keys[addressHex]; exists {
-		return "", ErrKeyAlreadyExists
 	}
 
 	// 保存到磁盘
@@ -80,9 +115,9 @@ func (ks *KeyStore) CreateNewAccount(password string) (string, error) {
 	}
 
 	// 缓存密钥
-	ks.keys[addressHex] = key
+	ks.keys[address] = key
 
-	return addressHex, nil
+	return address, nil
 }
 
 // ImportECDSA imports an unencrypted ECDSA private key
@@ -93,22 +128,30 @@ func (ks *KeyStore) ImportECDSA(privateKey *ecdsa.PrivateKey, password string) (
 	ks.mu.Lock()
 	defer ks.mu.Unlock()
 
-	// 创建Key结构
-	key, err := NewKeyFromECDSA(privateKey)
+	// 生成地址
+	address, err := ks.addressGenerator.GenerateAddress(privateKey.Public())
 	if err != nil {
-		return "", fmt.Errorf("failed to create key: %w", err)
+		return "", fmt.Errorf("failed to generate address: %w", err)
+	}
+
+	// 检查地址是否已存在
+	if _, exists := ks.keys[address]; exists {
+		return "", ErrKeyAlreadyExists
+	}
+
+	// 创建Key结构
+	key := &Key{
+		Address:    address,
+		PrivateKey: privateKey,
+		PublicKey:  privateKey.Public(),
+		Algorithm:  ks.algorithm.Name(),
+		CreatedAt:  time.Now().Unix(),
 	}
 
 	// 加密密钥
 	keyStoreFile, err := EncryptKey(key, password, ks.options)
 	if err != nil {
 		return "", fmt.Errorf("failed to encrypt key: %w", err)
-	}
-
-	// 检查地址是否已存在
-	addressHex := key.Address.Hex()
-	if _, exists := ks.keys[addressHex]; exists {
-		return "", ErrKeyAlreadyExists
 	}
 
 	// 保存到磁盘
@@ -118,9 +161,64 @@ func (ks *KeyStore) ImportECDSA(privateKey *ecdsa.PrivateKey, password string) (
 	}
 
 	// 缓存密钥
-	ks.keys[addressHex] = key
+	ks.keys[address] = key
 
-	return addressHex, nil
+	return address, nil
+}
+
+// ImportPrivateKey imports an unencrypted private key of any supported type
+// 导入未加密的私钥（支持多种类型）
+// 使用密码加密后存储
+// 返回地址和错误信息
+func (ks *KeyStore) ImportPrivateKey(privateKey interface{}, password string) (string, error) {
+	ks.mu.Lock()
+	defer ks.mu.Unlock()
+
+	// 获取公钥
+	var publicKey interface{}
+	switch pk := privateKey.(type) {
+	case *ecdsa.PrivateKey:
+		publicKey = pk.Public()
+	default:
+		return "", fmt.Errorf("unsupported private key type: %T", privateKey)
+	}
+
+	// 生成地址
+	address, err := ks.addressGenerator.GenerateAddress(publicKey)
+	if err != nil {
+		return "", fmt.Errorf("failed to generate address: %w", err)
+	}
+
+	// 检查地址是否已存在
+	if _, exists := ks.keys[address]; exists {
+		return "", ErrKeyAlreadyExists
+	}
+
+	// 创建Key结构
+	key := &Key{
+		Address:    address,
+		PrivateKey: privateKey,
+		PublicKey:  publicKey,
+		Algorithm:  ks.algorithm.Name(),
+		CreatedAt:  time.Now().Unix(),
+	}
+
+	// 加密密钥
+	keyStoreFile, err := EncryptKey(key, password, ks.options)
+	if err != nil {
+		return "", fmt.Errorf("failed to encrypt key: %w", err)
+	}
+
+	// 保存到磁盘
+	_, err = SaveKeyStoreFile(keyStoreFile, ks.path)
+	if err != nil {
+		return "", fmt.Errorf("failed to save key file: %w", err)
+	}
+
+	// 缓存密钥
+	ks.keys[address] = key
+
+	return address, nil
 }
 
 // ImportKey imports a key from a JSON keystore file
@@ -138,8 +236,7 @@ func (ks *KeyStore) ImportKey(keyJSON []byte, oldPassword, newPassword string) (
 	}
 
 	// 检查地址是否已存在
-	addressHex := key.Address.Hex()
-	if _, exists := ks.keys[addressHex]; exists {
+	if _, exists := ks.keys[key.Address]; exists {
 		return "", ErrKeyAlreadyExists
 	}
 
@@ -156,9 +253,9 @@ func (ks *KeyStore) ImportKey(keyJSON []byte, oldPassword, newPassword string) (
 	}
 
 	// 缓存密钥
-	ks.keys[addressHex] = key
+	ks.keys[key.Address] = key
 
-	return addressHex, nil
+	return key.Address, nil
 }
 
 // ExportKey exports a key as JSON
@@ -170,7 +267,7 @@ func (ks *KeyStore) ExportKey(address, password string) ([]byte, error) {
 	defer ks.mu.RUnlock()
 
 	// 检查地址格式
-	if !isValidHexAddress(address) {
+	if !ks.addressGenerator.ValidateAddress(address) {
 		return nil, errors.New("invalid address format")
 	}
 
@@ -204,7 +301,7 @@ func (ks *KeyStore) GetKey(address, password string) (*Key, error) {
 	defer ks.mu.RUnlock()
 
 	// 检查地址格式
-	if !isValidHexAddress(address) {
+	if !ks.addressGenerator.ValidateAddress(address) {
 		return nil, errors.New("invalid address format")
 	}
 
@@ -233,6 +330,11 @@ func (ks *KeyStore) GetKey(address, password string) (*Key, error) {
 // 根据地址和密码删除密钥
 // 返回错误信息
 func (ks *KeyStore) Delete(address, password string) error {
+	// 先验证地址格式
+	if !ks.addressGenerator.ValidateAddress(address) {
+		return errors.New("invalid address format")
+	}
+
 	// 先验证密码，不获取锁
 	// 查找密钥文件
 	keyFilePath, err := ks.findKeyFileByAddress(address)
@@ -287,8 +389,7 @@ func (ks *KeyStore) List() ([]string, error) {
 		}
 	}
 
-	// 使用map模式处理
-	return ks.mapFilenames(addresses), nil
+	return addresses, nil
 }
 
 // mapFilenames 对文件名切片进行映射处理
@@ -330,6 +431,11 @@ func (ks *KeyStore) HasAddress(address string) bool {
 func (ks *KeyStore) ChangePassword(address, oldPassword, newPassword string) error {
 	ks.mu.Lock()
 	defer ks.mu.Unlock()
+
+	// 验证地址格式
+	if !ks.addressGenerator.ValidateAddress(address) {
+		return errors.New("invalid address format")
+	}
 
 	// 查找密钥文件
 	keyFilePath, err := ks.findKeyFileByAddress(address)
@@ -411,15 +517,21 @@ func (ks *KeyStore) findKeyFileByAddress(address string) (string, error) {
 
 	// 查找匹配的地址
 	targetAddress := strings.ToLower(address)
+	// 移除0x前缀以便匹配
+	if strings.HasPrefix(targetAddress, "0x") {
+		targetAddress = targetAddress[2:]
+	}
+
 	for _, file := range files {
 		if file.IsDir() {
 			continue
 		}
 
 		// 检查文件名是否包含地址
-		// 格式: UTC--<timestamp>--<address>
+		// 格式: UTC--<timestamp>--<algorithm>--<address>
 		filename := file.Name()
-		if strings.Contains(strings.ToLower(filename), targetAddress) {
+		lowerFilename := strings.ToLower(filename)
+		if strings.Contains(lowerFilename, targetAddress) {
 			return filepath.Join(ks.path, filename), nil
 		}
 	}
@@ -429,7 +541,7 @@ func (ks *KeyStore) findKeyFileByAddress(address string) (string, error) {
 
 // scanKeyFiles scans the keystore directory for key files
 // 扫描keystore目录中的密钥文件
-// 返回文件路径列表和错误信息
+// 返回地址列表和错误信息
 func (ks *KeyStore) scanKeyFiles() ([]string, error) {
 	// 检查目录是否存在
 	if _, err := os.Stat(ks.path); os.IsNotExist(err) {
@@ -442,7 +554,7 @@ func (ks *KeyStore) scanKeyFiles() ([]string, error) {
 		return nil, fmt.Errorf("failed to read directory: %w", err)
 	}
 
-	var keyFiles []string
+	var addresses []string
 
 	// 检查每个文件
 	for _, file := range files {
@@ -453,47 +565,28 @@ func (ks *KeyStore) scanKeyFiles() ([]string, error) {
 		// 检查文件名是否符合keystore文件格式
 		fileName := file.Name()
 		if strings.HasPrefix(fileName, "UTC--") {
-			keyFiles = append(keyFiles, filepath.Join(ks.path, fileName))
+			// 从文件名中提取地址
+			// 格式: UTC--<timestamp>--<algorithm>--<address>
+			parts := strings.Split(fileName, "--")
+			if len(parts) >= 4 {
+				// 获取最后一部分作为地址
+				address := parts[len(parts)-1]
+				// 如果地址没有0x前缀，添加它
+				if !strings.HasPrefix(address, "0x") {
+					address = "0x" + address
+				}
+				addresses = append(addresses, address)
+			}
 		}
 	}
 
-	return keyFiles, nil
+	return addresses, nil
 }
 
 // parseKeyStoreFile 解析密钥文件（简化版本）
 func parseKeyStoreFile(data []byte, keyStoreFile *KeyStoreFile) error {
 	// 使用DecryptKey替代复杂的解析
 	return ParseKeyStoreFile(data)
-}
-
-// isValidHexAddress checks if a string is a valid hexadecimal address
-// 检查字符串是否为有效的十六进制地址
-// 返回布尔值
-func isValidHexAddress(address string) bool {
-	if len(address) != 40 && len(address) != 42 {
-		// 标准以太坊地址是40个十六进制字符，有时带0x前缀
-		return false
-	}
-
-	// 如果有0x前缀，检查剩余部分
-	if len(address) == 42 && (address[0] != '0' || address[1] != 'x') {
-		return false
-	}
-
-	// 检查是否为有效的十六进制字符串
-	hexStart := 0
-	if len(address) == 42 {
-		hexStart = 2
-	}
-
-	for i := hexStart; i < len(address); i++ {
-		c := address[i]
-		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
-			return false
-		}
-	}
-
-	return true
 }
 
 // GetKeyByUUID retrieves a key by UUID and password
@@ -541,28 +634,8 @@ func (ks *KeyStore) Sign(address string, hash []byte, password string) ([]byte, 
 		return nil, err
 	}
 
-	// 使用ECDSA签名
-	r, s, err := ecdsa.Sign(rand.Reader, key.PrivateKey, hash)
-	if err != nil {
-		return nil, fmt.Errorf("failed to sign: %w", err)
-	}
-
-	// 将r和s序列化为DER格式
-	// 注意：以太坊使用的是r||s格式，这里简化处理
-	rBytes := r.Bytes()
-	sBytes := s.Bytes()
-
-	// 确保r和s都是32字节
-	if len(rBytes) < 32 {
-		rBytes = append(make([]byte, 32-len(rBytes)), rBytes...)
-	}
-	if len(sBytes) < 32 {
-		sBytes = append(make([]byte, 32-len(sBytes)), sBytes...)
-	}
-
-	// 合并r和s
-	signature := append(rBytes, sBytes...)
-	return signature, nil
+	// 使用配置的算法签名
+	return ks.algorithm.Sign(key.PrivateKey, hash)
 }
 
 // Lock clears the in-memory key cache
@@ -617,7 +690,10 @@ type keystoreWallet struct {
 // 创建新钱包
 // 返回Wallet接口和错误信息
 func NewWallet(keydir string, options *KeyStoreOptions) (Wallet, error) {
-	ks := NewKeyStore(keydir, options)
+	ks, err := NewKeyStore(keydir, options)
+	if err != nil {
+		return nil, err
+	}
 	return &keystoreWallet{ks: ks}, nil
 }
 
@@ -667,15 +743,25 @@ func (w *keystoreWallet) Contains(address string) bool {
 // 安全地清理Key结构中的敏感数据
 // 防止内存泄露
 func CleanseKey(key *Key) {
-	if key != nil && key.PrivateKey != nil {
-		// 清理私钥的D值
-		if key.PrivateKey.D != nil {
-			key.PrivateKey.D.SetInt64(0)
+	if key != nil {
+		// 清理私钥
+		if key.PrivateKey != nil {
+			// 根据不同类型的私钥进行清理
+			switch pk := key.PrivateKey.(type) {
+			case *ecdsa.PrivateKey:
+				if pk.D != nil {
+					pk.D.SetInt64(0)
+				}
+			}
+			// 将私钥设置为nil
+			key.PrivateKey = nil
 		}
+
+		// 清理公钥
+		key.PublicKey = nil
+
 		// 清理地址
-		for i := range key.Address {
-			key.Address[i] = 0
-		}
+		key.Address = ""
 	}
 }
 

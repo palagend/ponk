@@ -3,16 +3,18 @@
 [![Go Version](https://img.shields.io/badge/Go-1.22%2B-blue.svg)](https://golang.org/)
 [![License: GPLv3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://opensource.org/license/gpl-3-0)
 
-一个符合Geth安全标准的密钥存储库，用于安全管理加密货币私钥。
+一个支持多种区块链平台的通用密钥存储库，用于安全管理加密货币私钥。
 
 ## ✨ 特性
 
+- **多链支持**：可配置不同的加密算法和地址生成器，支持多种区块链平台
 - **军事级加密**：采用AES-256-CTR + scrypt KDF加密方案
-- **完全兼容Geth**：支持标准Keystore文件格式，与Geth钱包完全互通
+- **完全兼容Geth**：默认支持标准Keystore文件格式，与Geth钱包完全互通
 - **内存安全**：敏感数据自动清零，防止内存泄露
 - **多平台支持**：Linux/macOS/Windows全平台兼容
-- **可扩展架构**：支持插件式存储后端
+- **可扩展架构**：支持插件式加密算法和地址生成器
 - **类型安全**：完整的Go类型系统支持
+- **灵活配置**：可根据需求选择不同的加密参数和算法
 
 ## 🏗️ 项目架构
 
@@ -20,7 +22,7 @@
 ```bash
 github.com/palagend/ponk/
 ├── cmd/keystore-cli/          # 命令行工具
-├── internal/crypto/           # 加密核心实现
+├── pkg/keystore/              # 加密核心实现
 ├── examples/                  # 使用示例
 ├── docs/                      # 详细文档
 └── tests/                     # 测试用例
@@ -79,90 +81,160 @@ go get github.com/palagend/ponk
 package main
 
 import (
-    "crypto/ecdsa"
-    "crypto/rand"
     "fmt"
     "log"
 
-    "github.com/ethereum/go-ethereum/crypto"
-    "github.com/palagend/ponk/internal/crypto"
+    "github.com/palagend/ponk/pkg/keystore"
 )
 
 func main() {
     // 初始化keystore管理器
-    ks := crypto.NewKeystoreManager("./secure-keystore")
-    
-    // 生成新密钥对
-    privKey, err := ecdsa.GenerateKey(crypto.S256(), rand.Reader)
+    ks, err := keystore.NewKeyStore("./secure-keystore", nil)
     if err != nil {
-        log.Fatal("生成私钥失败: ", err)
+        log.Fatal("初始化keystore失败: ", err)
     }
     
-    address := crypto.PubkeyToAddress(privKey.PublicKey)
-    fmt.Printf("新账户地址: %s\n", address.Hex())
-    
-    // 加密存储私钥
+    // 生成新账户
     password := "YourVeryStrongPassword123!"
-    if err := ks.StoreKey(privKey, password); err != nil {
-        log.Fatal("保存keystore失败: ", err)
+    address, err := ks.CreateNewAccount(password)
+    if err != nil {
+        log.Fatal("创建账户失败: ", err)
     }
     
+    fmt.Printf("新账户地址: %s\n", address)
     fmt.Println("✅ Keystore文件保存成功")
     
-    // 从keystore文件解密恢复私钥
-    recoveredKey, err := ks.GetKey(address, password)
+    // 从keystore文件获取密钥
+    key, err := ks.GetKey(address, password)
     if err != nil {
-        log.Fatal("恢复私钥失败: ", err)
+        log.Fatal("获取密钥失败: ", err)
     }
     
-    // 验证恢复的私钥
-    if recoveredKey.D.Cmp(privKey.D) == 0 {
-        fmt.Println("✅ 私钥恢复成功且验证通过")
+    fmt.Println("✅ 密钥获取成功")
+    fmt.Printf("   地址: %s\n", key.Address)
+    fmt.Printf("   算法: %s\n", key.Algorithm)
+}
+```
+
+### 多链配置示例
+
+```go
+package main
+
+import (
+    "fmt"
+    "log"
+
+    "github.com/palagend/ponk/pkg/keystore"
+)
+
+func main() {
+    // 自定义配置
+    options := keystore.DefaultKeyStoreOptions()
+    options.Algorithm = "ecdsa"        // 加密算法
+    options.AddressGenerator = "eth"    // 地址生成器
+    options.ScryptN = 16384             // 降低scrypt参数以加快测试速度
+    
+    // 初始化keystore管理器
+    ks, err := keystore.NewKeyStore("./multi-chain-keystore", options)
+    if err != nil {
+        log.Fatal("初始化keystore失败: ", err)
     }
+    
+    // 生成新账户
+    password := "MultiChainPassword123!"
+    address, err := ks.CreateNewAccount(password)
+    if err != nil {
+        log.Fatal("创建账户失败: ", err)
+    }
+    
+    fmt.Printf("新账户地址: %s\n", address)
+    fmt.Println("✅ 多链Keystore文件保存成功")
 }
 ```
 
 ## 📚 核心API
 
-### KeystoreManager接口
+### KeyStore结构体
 
 ```go
-type KeystoreManager interface {
-    // StoreKey 加密并存储私钥
-    StoreKey(key *ecdsa.PrivateKey, auth string) error
-    
-    // GetKey 解密并恢复私钥
-    GetKey(address common.Address, auth string) (*ecdsa.PrivateKey, error)
-    
-    // ListAccounts 列出所有存储的账户
-    ListAccounts() ([]common.Address, error)
-    
-    // ImportKey 导入keystore文件
-    ImportKey(keyJSON []byte, auth string) error
-    
-    // ExportKey 导出keystore文件
-    ExportKey(address common.Address, auth string) ([]byte, error)
-    
-    // DeleteKey 安全删除keystore文件
-    DeleteKey(address common.Address) error
+// 创建KeyStore实例
+func NewKeyStore(keydir string, options *KeyStoreOptions) (*KeyStore, error)
+
+// 创建新账户
+func (ks *KeyStore) CreateNewAccount(password string) (string, error)
+
+// 导入ECDSA私钥
+func (ks *KeyStore) ImportECDSA(privateKey *ecdsa.PrivateKey, password string) (string, error)
+
+// 导入通用私钥
+func (ks *KeyStore) ImportPrivateKey(privateKey interface{}, password string) (string, error)
+
+// 导入keystore文件
+func (ks *KeyStore) ImportKey(keyJSON []byte, oldPassword, newPassword string) (string, error)
+
+// 导出keystore文件
+func (ks *KeyStore) ExportKey(address, password string) ([]byte, error)
+
+// 获取密钥
+func (ks *KeyStore) GetKey(address, password string) (*Key, error)
+
+// 删除密钥
+func (ks *KeyStore) Delete(address, password string) error
+
+// 列出所有账户
+func (ks *KeyStore) List() ([]string, error)
+
+// 检查地址是否存在
+func (ks *KeyStore) HasAddress(address string) bool
+
+// 修改密码
+func (ks *KeyStore) ChangePassword(address, oldPassword, newPassword string) error
+
+// 使用私钥签名
+func (ks *KeyStore) Sign(address string, hash []byte, password string) ([]byte, error)
+```
+
+### Key结构体
+
+```go
+type Key struct {
+    Address     string      // 区块链地址
+    PrivateKey  interface{} // 私钥（类型取决于算法）
+    PublicKey   interface{} // 公钥（类型取决于算法）
+    Algorithm   string      // 加密算法
+    CreatedAt   int64       // 创建时间戳
 }
 ```
 
-### 高级配置
+### KeyStoreOptions配置
 
 ```go
-// 自定义scrypt参数
-ks := crypto.NewKeystoreManagerWithParams(
-    "/path/to/keystore",
-    crypto.ScryptParams{
-        N: 1 << 18,  // CPU/内存成本因子
-        P: 2,        // 并行化因子
-        R: 8,        // 块大小因子
-    },
-)
+// 默认配置
+func DefaultKeyStoreOptions() *KeyStoreOptions
 
-// 启用内存保护
-ks.EnableMemoryProtection(true)
+// 配置结构体
+type KeyStoreOptions struct {
+    // Scrypt参数
+    ScryptN int `json:"scryptN"`
+    ScryptR int `json:"scryptR"`
+    ScryptP int `json:"scryptP"`
+    
+    // 密码策略
+    MinPasswordLen     int  `json:"minPasswordLen"`
+    MaxPasswordLen     int  `json:"maxPasswordLen"`
+    PasswordComplexity bool `json:"passwordComplexity"`
+    
+    // 算法配置
+    Algorithm        string `json:"algorithm"`        // 加密算法
+    AddressGenerator string `json:"address_generator"` // 地址生成器
+}
+
+// 自定义配置示例
+options := keystore.DefaultKeyStoreOptions()
+options.ScryptN = 16384             // 降低scrypt参数以加快测试速度
+options.Algorithm = "ecdsa"        // 加密算法
+options.AddressGenerator = "eth"    // 地址生成器
 ```
 
 ## 🔧 命令行工具
